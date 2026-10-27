@@ -1,0 +1,439 @@
+<!doctype html><html><head><meta charset="utf-8"/>
+    <style>
+      * {box-sizing:border-box} html,body {margin:0;background:#111827;color:#e5e7eb;font:13px system-ui,Arial;overflow:hidden}
+      #controls {min-height:70px;display:flex;align-items:center;gap:13px;flex-wrap:wrap;padding:8px 12px;background:#192130;border-bottom:1px solid #374151}
+      label {display:inline-flex;gap:5px;align-items:center} select,input[type=number] {background:#0d1524;color:#e5e7eb;border:1px solid #485468;border-radius:4px;padding:4px;max-width:135px}
+      input[type=range]{width:105px;accent-color:#38bdf8} input[type=checkbox]{accent-color:#38bdf8}
+      #save-png {background:#2563eb;color:white;border:1px solid #60a5fa;border-radius:5px;padding:6px 11px;cursor:pointer;font-weight:600}
+      #save-png:disabled {opacity:.6;cursor:wait}
+      #save-status {font-size:12px;color:#a7f3d0}
+      #plot {width:100%;height:calc(100vh - 100px);min-height:460px}
+      #triad {position:absolute;width:105px;height:105px;bottom:12px;left:12px;z-index:10;pointer-events:none;background:rgba(17,24,39,.5);border:1px solid #374151;border-radius:8px}
+    </style></head><body>
+    <div id="controls">
+      <label>State <select id="state"></select></label>
+      <label>Colour <select id="component"><option>ΔY</option><option>ΔX</option><option>ΔZ</option><option>Total displacement</option></select></label>
+      <label>Deformation Scale Factor <input id="exaggeration" type="range" min="1" max="200" value="10"/><span id="factor">10×</span></label>
+      <label>View <select id="view"><option>Isometric</option><option>Along X</option><option>Along Y</option><option>Along Z</option></select></label>
+      <label><input id="beams" type="checkbox" checked/>Beams</label>
+      <label><input id="points" type="checkbox" checked/>Points</label>
+      <label><input id="labels" type="checkbox" checked/>IDs</label>
+      <label><input id="vectors" type="checkbox"/>Vectors</label>
+      <label><input id="auto" type="checkbox" checked/>Auto colours</label>
+      <label>Range <input id="range" type="number" min="0.1" step="0.1" value="10" disabled/></label>
+      <button type="button" id="save-png" title="Download a PNG of the current 3D view, including the colour scale">Save view as PNG</button>
+      <span id="save-status" role="status"></span>
+    </div>
+    <div id="plot"></div><svg id="triad" viewBox="0 0 105 105"><g id="arms"></g></svg>
+    <script src="./plotly.min.js"></script><script>
+    const source=__PAYLOAD__;
+    const plotDiv=document.getElementById('plot');
+    const el=id=>document.getElementById(id);
+    const byId=new Map(source.points.map(p=>[String(p.point_id),p]));
+    const states=[...new Set(source.measurements.map(m=>String(m.state??'')).filter(Boolean))];
+    for(const state of states){const opt=document.createElement('option');opt.value=state;opt.textContent=state;el('state').appendChild(opt)}
+    const scale=[[0,'#0000ff'],[.25,'#00bfff'],[.5,'#00ff00'],[.75,'#ffff00'],[1,'#ff0000']];
+    const cameras={
+      'Isometric':{eye:{x:1.6,y:1.25,z:1.6},up:{x:0,y:1,z:0}},
+      'Along X':{eye:{x:2.8,y:0,z:0},up:{x:0,y:1,z:0}},
+      'Along Y':{eye:{x:0,y:2.8,z:0},up:{x:0,y:0,z:-1}},
+      'Along Z':{eye:{x:0,y:0,z:2.8},up:{x:0,y:1,z:0}}
+    };
+    const cameraDefault=cameras.Isometric;
+    let currentCamera=cameraDefault;
+    const num=v=>v===null||v===undefined||v===''?NaN:Number(v);
+    const fmt=v=>Number.isFinite(v)?v.toFixed(2):'missing';
+    const axes=[{v:[1,0,0],color:'#ef4444',label:'X'},{v:[0,1,0],color:'#22c55e',label:'Y'},{v:[0,0,1],color:'#60a5fa',label:'Z'}];
+    const NS='http://www.w3.org/2000/svg';
+    function triad(cam){
+      if(!cam||!cam.eye)return;
+      const eye=cam.eye,up=cam.up||{x:0,y:1,z:0},cx=52,cy=52,len=32;
+      const norm=v=>{const d=Math.hypot(...v)||1;return v.map(x=>x/d)};
+      const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+      const dot=(a,b)=>a.reduce((n,x,i)=>n+x*b[i],0);
+      const forward=norm([-eye.x,-eye.y,-eye.z]);
+      const right=norm(cross(forward,[up.x,up.y,up.z]));
+      const upward=norm(cross(right,forward));
+      const elements=axes.map(a=>({a,x:cx+len*dot(a.v,right),y:cy-len*dot(a.v,upward),depth:dot(a.v,forward)}));
+      elements.sort((a,b)=>b.depth-a.depth);
+      const group=el('arms');group.replaceChildren();
+      elements.forEach(({a,x,y})=>{
+        const line=document.createElementNS(NS,'line');
+        [['x1',cx],['y1',cy],['x2',x],['y2',y],['stroke',a.color],['stroke-width',3]].forEach(([k,v])=>line.setAttribute(k,v));group.appendChild(line);
+        const circle=document.createElementNS(NS,'circle');
+        [['cx',x],['cy',y],['r',10],['fill',a.color]].forEach(([k,v])=>circle.setAttribute(k,v));group.appendChild(circle);
+        const t=document.createElementNS(NS,'text');t.textContent=a.label;
+        [['x',x],['y',y+4],['fill','#fff'],['font-size',12],['font-family','sans-serif'],['font-weight','bold'],['text-anchor','middle']].forEach(([k,v])=>t.setAttribute(k,v));group.appendChild(t);
+      });
+    }
+    function hexToRgb(hex){
+      const h=hex.replace('#','');
+      return [parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)];
+    }
+    function rgbToHex(rgb){
+      return '#' + rgb.map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,'0')).join('');
+    }
+    function interpolateColor(value,cmin,cmax){
+      if(!Number.isFinite(value)) return '#ffffff';
+      if(cmax<=cmin) return scale[scale.length-1][1];
+      const t=Math.max(0,Math.min(1,(value-cmin)/(cmax-cmin)));
+      for(let i=0;i<scale.length-1;i++){
+        const [t0,c0]=scale[i], [t1,c1]=scale[i+1];
+        if(t<=t1 || i===scale.length-2){
+          const local=(t-t0)/(t1-t0 || 1);
+          const a=hexToRgb(c0), b=hexToRgb(c1);
+          return rgbToHex(a.map((av,idx)=>av+(b[idx]-av)*local));
+        }
+      }
+      return scale[scale.length-1][1];
+    }
+    function midpointColor(v1,v2,cmin,cmax){
+      const a=Number.isFinite(v1)?v1:0;
+      const b=Number.isFinite(v2)?v2:a;
+      return interpolateColor((a+b)/2,cmin,cmax);
+    }
+    function vecLerp(a,b,t){ return {x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:a.z+(b.z-a.z)*t}; }
+    function sampleLinear(values, perInterval=12){
+      const out=[];
+      for(let i=0;i<values.length-1;i++){
+        for(let k=0;k<perInterval;k++){
+          const t=k/perInterval;
+          out.push(values[i]*(1-t)+values[i+1]*t);
+        }
+      }
+      out.push(values[values.length-1]);
+      return out;
+    }
+    function hermiteTangents(values){
+      const t=[];
+      for(let i=0;i<values.length;i++){
+        if(i===0) t.push(values[1]-values[0]);
+        else if(i===values.length-1) t.push(values[i]-values[i-1]);
+        else t.push(0.5*(values[i+1]-values[i-1]));
+      }
+      return t;
+    }
+    function sampleHermite(values, perInterval=14){
+      if(values.length<2) return values.slice();
+      const m=hermiteTangents(values);
+      const out=[];
+      for(let i=0;i<values.length-1;i++){
+        for(let k=0;k<perInterval;k++){
+          const t=k/perInterval;
+          const h00=2*t*t*t-3*t*t+1;
+          const h10=t*t*t-2*t*t+t;
+          const h01=-2*t*t*t+3*t*t;
+          const h11=t*t*t-t*t;
+          out.push(h00*values[i]+h10*m[i]+h01*values[i+1]+h11*m[i+1]);
+        }
+      }
+      out.push(values[values.length-1]);
+      return out;
+    }
+    // Geometry splines are cached per deployment state. Each beam is ONE Plotly
+    // 3D trace with numerical line.color values (instead of hundreds of traces).
+    const stateCache = new Map();
+    const nominalPoints = new Map(source.points.map(p=>[String(p.point_id),p]));
+    // Split the beam network into directional chains. Intersections in the frame
+    // are allowed: a point can belong to an X, Y and Z chain independently.
+    // A chain with >=3 points is interpolated smoothly in full 3D.
+    // Two-point chains remain straight, because no intermediate shape is measured.
+    function beamDirection(beam){
+      const a=nominalPoints.get(String(beam.start_point));
+      const b=nominalPoints.get(String(beam.end_point));
+      if(!a||!b)return null;
+      const diffs=[Math.abs(num(a.x_mm)-num(b.x_mm)),
+                   Math.abs(num(a.y_mm)-num(b.y_mm)),
+                   Math.abs(num(a.z_mm)-num(b.z_mm))];
+      if(!diffs.every(Number.isFinite) || Math.max(...diffs)<=0)return null;
+      return ['X','Y','Z'][diffs.indexOf(Math.max(...diffs))];
+    }
+    const directional=new Map([['X',[]],['Y',[]],['Z',[]]]);
+    const otherBeams=[];
+    for(const beam of source.beams){
+      const direction=beamDirection(beam);
+      if(direction)directional.get(direction).push(beam);
+      else otherBeams.push(beam);
+    }
+    const splineGroups=[];
+    const straightBeams=otherBeams.slice();
+    for(const [direction, beams] of directional){
+      const neighbours=new Map();
+      const edges=new Map();
+      for(const beam of beams){
+        const a=String(beam.start_point),b=String(beam.end_point);
+        if(!neighbours.has(a))neighbours.set(a,new Set());
+        if(!neighbours.has(b))neighbours.set(b,new Set());
+        neighbours.get(a).add(b);neighbours.get(b).add(a);
+        const key=[a,b].sort().join('\u0001');
+        if(!edges.has(key))edges.set(key,beam);
+      }
+      const used=new Set();
+      function edgeKey(a,b){return [a,b].sort().join('\u0001');}
+      function emitPath(ids){
+        if(ids.length>=3) splineGroups.push(ids.map(id=>nominalPoints.get(id)));
+        else if(ids.length===2){
+          const beam=edges.get(edgeKey(ids[0],ids[1]));
+          if(beam)straightBeams.push(beam);
+        }
+      }
+      function follow(start,next){
+        const ids=[start];let prev=start,cur=next;
+        used.add(edgeKey(start,next));ids.push(next);
+        while((neighbours.get(cur)||new Set()).size===2){
+          const nextId=[...neighbours.get(cur)].find(id=>id!==prev);
+          const key=edgeKey(cur,nextId);
+          if(used.has(key))break;
+          used.add(key);ids.push(nextId);prev=cur;cur=nextId;
+        }
+        return ids;
+      }
+      // Walk from chain endpoints / junctions first. This retains each branch
+      // without spuriously joining disconnected beam sections in a big spline.
+      for(const [id,adjacent] of neighbours){
+        if(adjacent.size===2)continue;
+        for(const next of adjacent){
+          if(!used.has(edgeKey(id,next)))emitPath(follow(id,next));
+        }
+      }
+      // Remaining edges form closed loops. Without a natural endpoint, leave
+      // them as straight connections rather than inventing a spline seam.
+      for(const [key,beam] of edges){
+        if(!used.has(key))straightBeams.push(beam);
+      }
+    }
+    // The grey reference comes DIRECTLY from Point_Coordinates and Beam_Connections.
+    // It is always visible alongside deployment states; no stowed/zero state is required.
+    // Nominal geometry is built once and NEVER scaled or regenerated by controls.
+    const referenceXYZ={x:[],y:[],z:[]};
+    for(const beam of source.beams){
+      const a=nominalPoints.get(String(beam.start_point)),b=nominalPoints.get(String(beam.end_point));
+      if(!a||!b)continue;
+      for(const [axis,k] of [['x','x_mm'],['y','y_mm'],['z','z_mm']]) referenceXYZ[axis].push(num(a[k]),num(b[k]),null);
+    }
+    function stateGeometry(state){
+      if(stateCache.has(state))return stateCache.get(state);
+      const measurements=new Map(source.measurements.filter(m=>String(m.state)===state).map(m=>[String(m.point_id),m]));
+      const lookup=new Map();
+      for(const p of source.points){
+        const id=String(p.point_id),m=measurements.get(id)||{};
+        const nominal=[num(p.x_mm),num(p.y_mm),num(p.z_mm)];
+        const raw=[num(m.dx_mm),num(m.dy_mm),num(m.dz_mm)];
+        const delta=raw.map(v=>Number.isFinite(v)?v:0);
+        const mag=raw.every(Number.isFinite)?Math.hypot(...raw):NaN;
+        lookup.set(id,{id,nominal,delta,raw,mag,valid:raw.every(Number.isFinite)});
+      }
+      const curves=[];
+      for(const beam of straightBeams){
+        const a=lookup.get(String(beam.start_point)),b=lookup.get(String(beam.end_point));
+        if(!a||!b)continue;
+        const points=[],deltas=[];
+        for(let k=0;k<=12;k++){
+          const t=k/12;
+          points.push(a.nominal.map((v,i)=>v+(b.nominal[i]-v)*t));
+          deltas.push(a.delta.map((v,i)=>v+(b.delta[i]-v)*t));
+        }
+        curves.push({points,deltas,valid:a.valid&&b.valid,width:5});
+      }
+      for(const group of splineGroups){
+        const ids=group.map(p=>String(p.point_id));
+        const nodes=ids.map(id=>lookup.get(id));
+        if(nodes.some(n=>!n))continue;
+        const n=nodes.length;
+        const nominal=[],deltas=[];
+        for(let c=0;c<3;c++){
+          nominal[c]=sampleHermite(nodes.map(n=>n.nominal[c]));
+          deltas[c]=sampleHermite(nodes.map(n=>n.delta[c]));
+        }
+        curves.push({points:nominal[0].map((_,i)=>[nominal[0][i],nominal[1][i],nominal[2][i]]),
+          deltas:deltas[0].map((_,i)=>[deltas[0][i],deltas[1][i],deltas[2][i]]),
+          valid:nodes.every(n=>n.valid),width:6});
+      }
+      const result={lookup,curves};stateCache.set(state,result);return result;
+    }
+    function scalar(d,component){
+      return component==='ΔX'?Math.abs(d[0]):component==='ΔY'?Math.abs(d[1]):component==='ΔZ'?Math.abs(d[2]):Math.hypot(...d);
+    }
+    function traces(){
+      const state=el('state').value,factor=Number(el('exaggeration').value),component=el('component').value;
+      const geometry=stateGeometry(state);
+      const show=el('beams').checked,showPts=el('points').checked;
+      const vals=[...geometry.lookup.values()].filter(p=>p.valid).map(p=>scalar(p.delta,component));
+      const cmax=el('auto').checked?Math.max(1e-12,...vals):Math.max(.1,num(el('range').value)||10);
+      const data=[{type:'scatter3d',mode:'lines',x:referenceXYZ.x,y:referenceXYZ.y,z:referenceXYZ.z,
+        visible:show,hoverinfo:'skip',line:{color:'#858b95',width:4}}];
+      for(const curve of geometry.curves){
+        const coords=curve.points.map((p,i)=>p.map((v,j)=>v+factor*curve.deltas[i][j]));
+        // A single numeric colour array produces continuous mapping along the beam.
+        const colour=curve.deltas.map(d=>curve.valid?scalar(d,component):null);
+        data.push({type:'scatter3d',mode:'lines',x:coords.map(p=>p[0]),y:coords.map(p=>p[1]),z:coords.map(p=>p[2]),
+          visible:show,hoverinfo:'skip',line:{color:colour,colorscale:scale,cmin:0,cmax,width:curve.width,showscale:false}});
+      }
+      const px=[],py=[],pz=[],colors=[],texts=[],hovers=[],vx=[],vy=[],vz=[];
+      for(const p of geometry.lookup.values()){
+        if(!p.nominal.every(Number.isFinite))continue;
+        const loc=p.nominal.map((v,j)=>v+factor*p.delta[j]);
+        px.push(loc[0]);py.push(loc[1]);pz.push(loc[2]);texts.push(p.id);
+        colors.push(p.valid?scalar(p.delta,component):null);
+        hovers.push(`Point ID: ${p.id}<br>ΔX: ${fmt(p.raw[0])} mm<br>ΔY: ${fmt(p.raw[1])} mm<br>ΔZ: ${fmt(p.raw[2])} mm<br>|Δ|: ${fmt(p.mag)} mm`);
+        if(p.valid){vx.push(p.nominal[0],loc[0],null);vy.push(p.nominal[1],loc[1],null);vz.push(p.nominal[2],loc[2],null)}
+      }
+      data.push({type:'scatter3d',mode:el('labels').checked?'markers+text':'markers',x:px,y:py,z:pz,text:texts,textposition:'top center',
+        textfont:{color:'#f3f4f6',size:10},visible:showPts,marker:{size:6,color:colors,colorscale:scale,cmin:0,cmax,showscale:false},hovertext:hovers,hoverinfo:'text'});
+      data.push({type:'scatter3d',mode:'markers',x:[null],y:[null],z:[null],hoverinfo:'skip',showlegend:false,
+        marker:{size:0,color:[0],colorscale:scale,cmin:0,cmax,showscale:true,colorbar:{title:{text:'δ [mm]',font:{color:'#e5e7eb'}},tickformat:'.2f',tickfont:{color:'#e5e7eb'},outlinecolor:'#64748b',bgcolor:'#111827',len:.78,thickness:16}}});
+      data.push({type:'scatter3d',mode:'lines',x:vx,y:vy,z:vz,visible:el('vectors').checked,hoverinfo:'skip',line:{color:'#f59e0b',width:3}});
+      return data;
+    }
+    // Stable scene limits across all states/exaggerations.  Preserve camera framing.
+    const numericPoints=source.points.filter(p=>['x_mm','y_mm','z_mm'].every(k=>Number.isFinite(num(p[k]))));
+    const limits={};
+    for(const [axis,daxis] of [['x','dx_mm'],['y','dy_mm'],['z','dz_mm']]){
+      const base=numericPoints.map(p=>num(p[axis+'_mm']));
+      const maxDelta=Math.max(0,...source.measurements.map(m=>Math.abs(num(m[daxis]))).filter(Number.isFinite));
+      const low=Math.min(...base)-200*maxDelta, high=Math.max(...base)+200*maxDelta;
+      const pad=Math.max(50,(high-low)*0.08);
+      limits[axis]=[low-pad,high+pad];
+    }
+    // Fix scene aspect to the immutable nominal frame proportions.  The exaggerated
+    // scenario can move inside the fixed view, but must NEVER resize the XYZ axes.
+    const nominalSpan = {};
+    for (const axis of ['x','y','z']) {
+      const values = numericPoints.map(p => num(p[axis+'_mm']));
+      nominalSpan[axis] = Math.max(1, Math.max(...values) - Math.min(...values));
+    }
+    const largestNominalSpan = Math.max(nominalSpan.x,nominalSpan.y,nominalSpan.z);
+    const fixedAspect = {
+      x:nominalSpan.x/largestNominalSpan,
+      y:nominalSpan.y/largestNominalSpan,
+      z:nominalSpan.z/largestNominalSpan
+    };
+    // Each range has padding for the maximum exaggeration. Set the displayed
+    // box aspect proportional to range widths, maintaining equal units on XYZ.
+    // This avoids making longitudinal members look shorter as Z grows.
+    const rangeSpans = Object.fromEntries(['x','y','z'].map(a=>[a,limits[a][1]-limits[a][0]]));
+    const largestRangeSpan = Math.max(rangeSpans.x,rangeSpans.y,rangeSpans.z);
+    const sceneAspect = {
+      x:rangeSpans.x/largestRangeSpan,
+      y:rangeSpans.y/largestRangeSpan,
+      z:rangeSpans.z/largestRangeSpan
+    };
+    const layout={paper_bgcolor:'#111827',plot_bgcolor:'#111827',showlegend:false,margin:{l:0,r:0,t:5,b:0},font:{color:'#e5e7eb'},height:Math.max(460,window.innerHeight-100),
+      uirevision:'keep-camera',scene:{bgcolor:'#111827',aspectmode:'manual',aspectratio:sceneAspect,camera:cameraDefault,uirevision:'keep-camera',
+        xaxis:{visible:false,range:limits.x,autorange:false},yaxis:{visible:false,range:limits.y,autorange:false},zaxis:{visible:false,range:limits.z,autorange:false}}};
+    // Update existing traces only, and coalesce rapid slider events.
+    let redrawBusy=false, redrawPending=false;
+    function liveCamera(){
+      const glScene=plotDiv._fullLayout?.scene?._scene;
+      if(glScene && typeof glScene.getCamera==='function'){
+        try{return JSON.parse(JSON.stringify(glScene.getCamera()))}catch(e){}
+      }
+      return JSON.parse(JSON.stringify(currentCamera));
+    }
+    async function processRedraw(){
+      if(redrawBusy){redrawPending=true;return;}
+      redrawBusy=true;
+      try{
+        do{
+          redrawPending=false;
+          const next=traces();
+          const cam=liveCamera();
+          // Same trace count and order for each state. No graph recreation.
+          // Reference coordinates (trace 0) are not modified.
+          const idx=Array.from({length:next.length-1},(_,i)=>i+1);
+          await Plotly.restyle(plotDiv,{
+            x:idx.map(i=>next[i].x),y:idx.map(i=>next[i].y),z:idx.map(i=>next[i].z),
+            visible:idx.map(i=>next[i].visible===undefined?true:next[i].visible),
+            mode:idx.map(i=>next[i].mode),
+            'line.color':idx.map(i=>next[i].line?.color??null),
+            'line.cmin':idx.map(i=>next[i].line?.cmin??null),
+            'line.cmax':idx.map(i=>next[i].line?.cmax??null),
+            'marker.color':idx.map(i=>next[i].marker?.color??null),
+            'marker.cmax':idx.map(i=>next[i].marker?.cmax??null),
+            text:idx.map(i=>next[i].text??null),hovertext:idx.map(i=>next[i].hovertext??null)
+          },idx);
+          if(plotDiv.data[0].visible!==next[0].visible) await Plotly.restyle(plotDiv,{visible:next[0].visible},[0]);
+          currentCamera=cam;triad(cam);
+        }while(redrawPending);
+      }catch(err){console.error('Viewer update error:',err)}
+      finally{redrawBusy=false;}
+    }
+    let sliderTimer=null;
+    function redraw(){
+      el('factor').textContent=el('exaggeration').value+'×';
+      el('range').disabled=el('auto').checked;
+      processRedraw();
+    }
+    function throttledRedraw(){
+      el('factor').textContent=el('exaggeration').value+'×';
+      if(sliderTimer!==null)return;
+      sliderTimer=setTimeout(()=>{sliderTimer=null;redraw()},40);
+    }
+    Plotly.newPlot(plotDiv,traces(),layout,{displaylogo:false,scrollZoom:true,responsive:true}).then(()=>{
+      triad(cameraDefault);
+      plotDiv.on('plotly_relayout',data=>{
+        const cam=data['scene.camera']||liveCamera();
+        if(cam){currentCamera=JSON.parse(JSON.stringify(cam));triad(currentCamera)}
+      });
+      for(const id of ['state','component','exaggeration','beams','points','labels','vectors','auto','range']){
+        el(id).addEventListener(id==='exaggeration'||id==='range'?'input':'change',id==='exaggeration'?throttledRedraw:redraw);
+      }
+      el('view').addEventListener('change',()=>{
+        currentCamera=JSON.parse(JSON.stringify(cameras[el('view').value]));
+        Plotly.relayout(plotDiv,{'scene.camera':currentCamera});
+        triad(currentCamera);
+      });
+      // Export the live Plotly WebGL scene, including its current camera and
+      // colour bar. Composite the CAD direction triad on top of the PNG.
+      el('save-png').addEventListener('click',async()=>{
+        const button=el('save-png'),status=el('save-status');
+        button.disabled=true;status.textContent='Preparing image…';
+        try{
+          // If the deformation slider was just moved, let its queued restyle finish.
+          if(sliderTimer!==null){clearTimeout(sliderTimer);sliderTimer=null;redraw()}
+          while(redrawBusy || redrawPending){await new Promise(r=>setTimeout(r,60))}
+          const png=await Plotly.toImage(plotDiv,{format:'png',width:Math.round(plotDiv.clientWidth),height:Math.max(460,window.innerHeight-100),scale:2});
+          const base=new Image();base.src=png;await base.decode();
+          const canvas=document.createElement('canvas');canvas.width=base.naturalWidth;canvas.height=base.naturalHeight;
+          const ctx=canvas.getContext('2d');ctx.drawImage(base,0,0);
+          // The triad sits outside Plotly, so include it separately in the image.
+          const triadSvg=el('triad');
+          if(triadSvg){
+            const bounds=triadSvg.getBoundingClientRect(),plotBounds=plotDiv.getBoundingClientRect();
+            const rx=canvas.width/plotBounds.width,ry=canvas.height/plotBounds.height;
+            const x=(bounds.left-plotBounds.left)*rx,y=(bounds.top-plotBounds.top)*ry;
+            const w=bounds.width*rx,h=bounds.height*ry;
+            ctx.fillStyle='rgba(17,24,39,.85)';ctx.fillRect(x,y,w,h);
+            ctx.strokeStyle='#374151';ctx.strokeRect(x,y,w,h);
+            const clone=triadSvg.cloneNode(true);
+            clone.setAttribute('xmlns','http://www.w3.org/2000/svg');
+            clone.setAttribute('width','105');clone.setAttribute('height','105');
+            const url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(clone)],{type:'image/svg+xml;charset=utf-8'}));
+            try{
+              const triadImg=new Image();triadImg.src=url;await triadImg.decode();
+              ctx.drawImage(triadImg,x,y,w,h);
+            }finally{URL.revokeObjectURL(url)}
+          }
+          const state=(el('state').value||'frame').replace(/[^a-z0-9_-]+/gi,'_').slice(0,65);
+          const filename=`frame_${state}_${el('exaggeration').value}x.png`;
+          const link=document.createElement('a');link.download=filename;link.href=canvas.toDataURL('image/png');
+          document.body.appendChild(link);link.click();link.remove();
+          status.textContent='PNG saved';
+        }catch(err){console.error('PNG export failed:',err);status.textContent='Image export failed — see browser console';}
+        finally{button.disabled=false;}
+      });
+      // Experimental: Plotly normally uses right-drag to pan. Map middle-button down/up onto that mode.
+      const synthetic=new WeakSet();
+      function middleToRight(e){
+        if(synthetic.has(e)||e.button!==1)return;
+        e.preventDefault();e.stopImmediatePropagation();
+        const replacement=new MouseEvent(e.type,{bubbles:true,cancelable:true,composed:true,
+          clientX:e.clientX,clientY:e.clientY,screenX:e.screenX,screenY:e.screenY,
+          button:2,buttons:e.type==='mouseup'?0:2,ctrlKey:e.ctrlKey,
+          shiftKey:e.shiftKey,altKey:e.altKey,metaKey:e.metaKey});
+        synthetic.add(replacement);e.target.dispatchEvent(replacement);
+      }
+      ['mousedown','mouseup'].forEach(t=>plotDiv.addEventListener(t,middleToRight,true));
+      plotDiv.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault()},true);
+    });
+    </script></body></html>
