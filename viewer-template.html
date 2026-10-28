@@ -5,6 +5,7 @@
       label {display:inline-flex;gap:5px;align-items:center} select,input[type=number] {background:#0d1524;color:#e5e7eb;border:1px solid #485468;border-radius:4px;padding:4px;max-width:135px}
       input[type=range]{width:105px;accent-color:#38bdf8} input[type=checkbox]{accent-color:#38bdf8}
       #save-png {background:#2563eb;color:white;border:1px solid #60a5fa;border-radius:5px;padding:6px 11px;cursor:pointer;font-weight:600}
+      #animate-toggle {background:#1f4f9f;color:white;border:1px solid #60a5fa;border-radius:5px;padding:6px 11px;cursor:pointer;font-weight:600}
       #save-png:disabled {opacity:.6;cursor:wait}
       #save-status {font-size:12px;color:#a7f3d0}
       #plot {width:100%;height:calc(100vh - 100px);min-height:460px}
@@ -12,6 +13,8 @@
     </style></head><body>
     <div id="controls">
       <label>State <select id="state"></select></label>
+      <button type="button" id="animate-toggle" title="Loop the selected scenario from REF to deformed and back">Start animation</button>
+      <label>Animation speed <input id="animation-speed" type="range" min="0.25" max="3" step="0.25" value="1"/><span id="animation-speed-value">1.00×</span></label>
       <label>Colour <select id="component"><option>ΔY</option><option>ΔX</option><option>ΔZ</option><option>Total displacement</option></select></label>
       <label>Deformation Scale Factor <input id="exaggeration" type="range" min="1" max="200" value="10"/><span id="factor">10×</span></label>
       <label>View <select id="view"><option>Isometric</option><option>Along X</option><option>Along Y</option><option>Along Z</option></select></label>
@@ -30,7 +33,8 @@
     const plotDiv=document.getElementById('plot');
     const el=id=>document.getElementById(id);
     const byId=new Map(source.points.map(p=>[String(p.point_id),p]));
-    const states=[...new Set(source.measurements.map(m=>String(m.state??'')).filter(Boolean))];
+    const workbookStates=[...new Set(source.measurements.map(m=>String(m.state??'')).filter(Boolean))];
+    const states=['REF',...workbookStates];
     for(const state of states){const opt=document.createElement('option');opt.value=state;opt.textContent=state;el('state').appendChild(opt)}
     const scale=[[0,'#0000ff'],[.25,'#00bfff'],[.5,'#00ff00'],[.75,'#ffff00'],[1,'#ff0000']];
     const cameras={
@@ -213,15 +217,17 @@
     }
     function stateGeometry(state){
       if(stateCache.has(state))return stateCache.get(state);
-      const measurements=new Map(source.measurements.filter(m=>String(m.state)===state).map(m=>[String(m.point_id),m]));
+      const measurements=state==='REF'
+        ? new Map()
+        : new Map(source.measurements.filter(m=>String(m.state)===state).map(m=>[String(m.point_id),m]));
       const lookup=new Map();
       for(const p of source.points){
         const id=String(p.point_id),m=measurements.get(id)||{};
         const nominal=[num(p.x_mm),num(p.y_mm),num(p.z_mm)];
-        const raw=[num(m.dx_mm),num(m.dy_mm),num(m.dz_mm)];
+        const raw=state==='REF' ? [0,0,0] : [num(m.dx_mm),num(m.dy_mm),num(m.dz_mm)];
         const delta=raw.map(v=>Number.isFinite(v)?v:0);
         const mag=raw.every(Number.isFinite)?Math.hypot(...raw):NaN;
-        lookup.set(id,{id,nominal,delta,raw,mag,valid:raw.every(Number.isFinite)});
+        lookup.set(id,{id,nominal,delta,raw,mag,valid:state==='REF' ? true : raw.every(Number.isFinite)});
       }
       const curves=[];
       for(const beam of straightBeams){
@@ -255,17 +261,17 @@
       return component==='ΔX'?Math.abs(d[0]):component==='ΔY'?Math.abs(d[1]):component==='ΔZ'?Math.abs(d[2]):Math.hypot(...d);
     }
     function traces(){
-      const state=el('state').value,factor=Number(el('exaggeration').value),component=el('component').value;
+      const state=el('state').value,displayFactor=Number(el('exaggeration').value),factor=displayFactor*animationMorph,component=el('component').value;
       const geometry=stateGeometry(state);
       const show=el('beams').checked,showPts=el('points').checked;
       const vals=[...geometry.lookup.values()].filter(p=>p.valid).map(p=>scalar(p.delta,component));
       const cmax=el('auto').checked?Math.max(1e-12,...vals):Math.max(.1,num(el('range').value)||10);
       const data=[{type:'scatter3d',mode:'lines',x:referenceXYZ.x,y:referenceXYZ.y,z:referenceXYZ.z,
-        visible:show,hoverinfo:'skip',line:{color:'#858b95',width:4}}];
+        visible:show && state!=='REF',hoverinfo:'skip',line:{color:'#858b95',width:4}}];
       for(const curve of geometry.curves){
         const coords=curve.points.map((p,i)=>p.map((v,j)=>v+factor*curve.deltas[i][j]));
         // A single numeric colour array produces continuous mapping along the beam.
-        const colour=curve.deltas.map(d=>curve.valid?scalar(d,component):null);
+        const colour=curve.deltas.map(d=>curve.valid?animationMorph*scalar(d,component):null);
         data.push({type:'scatter3d',mode:'lines',x:coords.map(p=>p[0]),y:coords.map(p=>p[1]),z:coords.map(p=>p[2]),
           visible:show,hoverinfo:'skip',line:{color:colour,colorscale:scale,cmin:0,cmax,width:curve.width,showscale:false}});
       }
@@ -274,7 +280,7 @@
         if(!p.nominal.every(Number.isFinite))continue;
         const loc=p.nominal.map((v,j)=>v+factor*p.delta[j]);
         px.push(loc[0]);py.push(loc[1]);pz.push(loc[2]);texts.push(p.id);
-        colors.push(p.valid?scalar(p.delta,component):null);
+        colors.push(p.valid?animationMorph*scalar(p.delta,component):null);
         hovers.push(`Point ID: ${p.id}<br>ΔX: ${fmt(p.raw[0])} mm<br>ΔY: ${fmt(p.raw[1])} mm<br>ΔZ: ${fmt(p.raw[2])} mm<br>|Δ|: ${fmt(p.mag)} mm`);
         if(p.valid){vx.push(p.nominal[0],loc[0],null);vy.push(p.nominal[1],loc[1],null);vz.push(p.nominal[2],loc[2],null)}
       }
@@ -323,6 +329,63 @@
         xaxis:{visible:false,range:limits.x,autorange:false},yaxis:{visible:false,range:limits.y,autorange:false},zaxis:{visible:false,range:limits.z,autorange:false}}};
     // Update existing traces only, and coalesce rapid slider events.
     let redrawBusy=false, redrawPending=false;
+    let animationMorph=1;
+    let animationEnabled=false;
+    let animationFrameId=null;
+    let animationLastMs=null;
+    let animationPhase=0;
+    let animationLastDrawMs=null;
+    const animationPeriodMs=2200;
+    function updateAnimationSpeed(){
+      el('animation-speed-value').textContent=Number(el('animation-speed').value).toFixed(2)+'×';
+    }
+    function updateAnimationButton(){
+      const btn=el('animate-toggle');
+      const refSelected=el('state').value==='REF';
+      btn.disabled=refSelected;
+      btn.textContent=animationEnabled ? 'Stop animation' : 'Start animation';
+      btn.style.opacity=refSelected ? '.6' : '1';
+      if(refSelected) btn.textContent='Animation unavailable for REF';
+    }
+    function stopAnimation(resetMorph=true){
+      animationEnabled=false;
+      if(animationFrameId!==null){cancelAnimationFrame(animationFrameId);animationFrameId=null;}
+      animationLastMs=null;
+      animationLastDrawMs=null;
+      animationPhase=0;
+      if(resetMorph) animationMorph=1;
+      updateAnimationButton();
+    }
+    function animationLoop(ts){
+      if(!animationEnabled) return;
+      if(animationLastMs===null) animationLastMs=ts;
+      const dt=Math.min(250,Math.max(0,ts-animationLastMs));
+      animationLastMs=ts;
+      animationPhase=(animationPhase + dt*Number(el('animation-speed').value)/animationPeriodMs)%2;
+      animationMorph=animationPhase<1 ? animationPhase : (2-animationPhase);
+      // Plotly WebGL restyling can be expensive. Limit requested draws to ~25 fps.
+      if(animationLastDrawMs===null || ts-animationLastDrawMs>=40){
+        animationLastDrawMs=ts;
+        processRedraw();
+      }
+      animationFrameId=requestAnimationFrame(animationLoop);
+    }
+    function toggleAnimation(){
+      if(el('state').value==='REF') return;
+      animationEnabled=!animationEnabled;
+      if(animationEnabled){
+        animationPhase=0;
+        animationMorph=0;
+        animationLastMs=null;
+        animationLastDrawMs=null;
+        processRedraw();
+        animationFrameId=requestAnimationFrame(animationLoop);
+      }else{
+        stopAnimation(true);
+        processRedraw();
+      }
+      updateAnimationButton();
+    }
     function liveCamera(){
       const glScene=plotDiv._fullLayout?.scene?._scene;
       if(glScene && typeof glScene.getCamera==='function'){
@@ -362,6 +425,7 @@
     function redraw(){
       el('factor').textContent=el('exaggeration').value+'×';
       el('range').disabled=el('auto').checked;
+      updateAnimationButton();
       processRedraw();
     }
     function throttledRedraw(){
@@ -371,13 +435,22 @@
     }
     Plotly.newPlot(plotDiv,traces(),layout,{displaylogo:false,scrollZoom:true,responsive:true}).then(()=>{
       triad(cameraDefault);
+      updateAnimationButton();
+      updateAnimationSpeed();
+      el('animation-speed').addEventListener('input',updateAnimationSpeed);
       plotDiv.on('plotly_relayout',data=>{
         const cam=data['scene.camera']||liveCamera();
         if(cam){currentCamera=JSON.parse(JSON.stringify(cam));triad(currentCamera)}
       });
-      for(const id of ['state','component','exaggeration','beams','points','labels','vectors','auto','range']){
+      for(const id of ['component','exaggeration','beams','points','labels','vectors','auto','range']){
         el(id).addEventListener(id==='exaggeration'||id==='range'?'input':'change',id==='exaggeration'?throttledRedraw:redraw);
       }
+      el('state').addEventListener('change',()=>{
+        if(el('state').value==='REF') stopAnimation(false);
+        else if(!animationEnabled) animationMorph=1;
+        redraw();
+      });
+      el('animate-toggle').addEventListener('click',toggleAnimation);
       el('view').addEventListener('change',()=>{
         currentCamera=JSON.parse(JSON.stringify(cameras[el('view').value]));
         Plotly.relayout(plotDiv,{'scene.camera':currentCamera});
